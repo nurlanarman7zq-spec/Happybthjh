@@ -1,1 +1,890 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Sparkles, Upload, Music, Volume2, VolumeX, Copy, Check, 
+  Share2, ArrowRight, Heart, RefreshCw, AlertCircle, Camera,
+  FileAudio, Lock, Globe, Terminal, HelpCircle, Smartphone, 
+  Play, ChevronRight, X
+} from 'lucide-react';
 
+/* ==========================================================================
+   SUPABASE CLIENT CONFIGURATION & INSTRUCTIONS
+   ================================================================          
+   To connect this app with Supabase for real cloud links on GitHub Pages:
+   1. Create a project on Supabase (supabase.com)
+   2. In Project Settings > API, copy your `SUPABASE_URL` and `SUPABASE_ANON_KEY`.
+   3. In Storage, create a public bucket named: `greetings-media`
+   4. In Database (SQL Editor), create the table `greetings`:
+      CREATE TABLE greetings (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        photo_url TEXT NOT NULL,
+        music_url TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+   5. Configure RLS Policies:
+      - Enable RLS on `greetings` table. Allow public INSERT and public SELECT.
+      - Enable public read/write access policies on storage bucket `greetings-media`.
+   ========================================================================== */
+
+const CONFIG = {
+  SUPABASE_URL: "https://YOUR_SUPABASE_URL.supabase.co", // Replace with your Supabase URL
+  SUPABASE_ANON_KEY: "YOUR_SUPABASE_ANON_KEY", // Replace with your Supabase Anon Key
+  BUCKET_NAME: "greetings-media"
+};
+
+/* ==========================================================================
+   IMAGE COMPRESSION & VALIDATION UTILITIES
+   ================================================================          
+   Compresses and resizes large user photos before upload to ensure fast loads.
+   ========================================================================== */
+const compressImage = (file) => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target.result;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 1200;
+        const MAX_HEIGHT = 1200;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+
+        canvas.toBlob((blob) => {
+          if (!blob) {
+            reject(new Error('Image compression failed'));
+            return;
+          }
+          const compressedFile = new File([blob], file.name.replace(/\.[^/.]+$/, "") + ".jpg", {
+            type: 'image/jpeg',
+            lastModified: Date.now(),
+          });
+          resolve(compressedFile);
+        }, 'image/jpeg', 0.82);
+      };
+      img.onerror = (error) => reject(error);
+    };
+    reader.onerror = (error) => reject(error);
+  });
+};
+
+/* ==========================================================================
+   MAIN APP COMPONENT
+   ================================================================          
+   Manages routing via query params (?id=...), creation wizard, preview, and 
+   immersive greeting experience.
+   ========================================================================== */
+export default function App() {
+  const [view, setView] = useState('home'); // 'home', 'created', 'greeting', 'guide'
+  const [greetingId, setGreetingId] = useState(null);
+  
+  // Creation Form State
+  const [step, setStep] = useState(1);
+  const [name, setName] = useState('');
+  const [photoFile, setPhotoFile] = useState(null);
+  const [photoPreview, setPhotoPreview] = useState(null);
+  const [musicFile, setMusicFile] = useState(null);
+  const [isCreating, setIsCreating] = useState(false);
+  const [creationProgress, setCreationProgress] = useState(0);
+  const [errorMessage, setErrorMessage] = useState('');
+
+  // Created Result State
+  const [shareUrl, setShareUrl] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  // Greeting Viewer State
+  const [greetingData, setGreetingData] = useState(null);
+  const [isLoadingGreeting, setIsLoadingGreeting] = useState(false);
+  const [greetingError, setGreetingError] = useState('');
+  const [isOpened, setIsOpened] = useState(false);
+  const [isPlayingMusic, setIsPlayingMusic] = useState(false);
+  const audioRef = useRef(null);
+
+  // Parse URL query parameter on mount for GitHub Pages compatibility (?id=...)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const id = params.get('id');
+    if (id) {
+      setGreetingId(id);
+      setView('greeting');
+      fetchGreetingData(id);
+    }
+  }, []);
+
+  const uploadToSupabaseStorage = async (file, path) => {
+    // If Supabase keys are not configured, fallback to local blob URLs or simulated storage for offline testing
+    if (CONFIG.SUPABASE_URL.includes("YOUR_") || !CONFIG.SUPABASE_URL) {
+      return URL.createObjectURL(file);
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await fetch(`${CONFIG.SUPABASE_URL}/storage/v1/object/${CONFIG.BUCKET_NAME}/${path}`, {
+      method: 'POST',
+      headers: {
+        'apikey': CONFIG.SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${CONFIG.SUPABASE_ANON_KEY}`
+      },
+      body: file
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to upload file to storage.');
+    }
+
+    const publicUrlRes = await fetch(`${CONFIG.SUPABASE_URL}/storage/v1/object/public/${CONFIG.BUCKET_NAME}/${path}`, {
+      method: 'GET',
+      headers: { 'apikey': CONFIG.SUPABASE_ANON_KEY }
+    });
+
+    return `${CONFIG.SUPABASE_URL}/storage/v1/object/public/${CONFIG.BUCKET_NAME}/${path}`;
+  };
+
+  const saveGreetingRecord = async (id, name, photoUrl, musicUrl) => {
+    if (CONFIG.SUPABASE_URL.includes("YOUR_") || !CONFIG.SUPABASE_URL) {
+      // Fallback local storage mock database for instant testing without setting up Supabase immediately
+      const localDb = JSON.parse(localStorage.getItem('mock_greetings') || '{}');
+      localDb[id] = { id, name, photo_url: photoUrl, music_url: musicUrl, created_at: new Date().toISOString() };
+      localStorage.setItem('mock_greetings', JSON.stringify(localDb));
+      return;
+    }
+
+    const response = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/greetings`, {
+      method: 'POST',
+      headers: {
+        'apikey': CONFIG.SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${CONFIG.SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal'
+      },
+      body: JSON.stringify({ id, name, photo_url: photoUrl, music_url: musicUrl })
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to save greeting record in database.');
+    }
+  };
+
+  const fetchGreetingData = async (id) => {
+    setIsLoadingGreeting(true);
+    setGreetingError('');
+    try {
+      if (CONFIG.SUPABASE_URL.includes("YOUR_") || !CONFIG.SUPABASE_URL) {
+        const localDb = JSON.parse(localStorage.getItem('mock_greetings') || '{}');
+        const data = localDb[id];
+        if (data) {
+          setGreetingData(data);
+        } else {
+          setGreetingError('Поздравление не найдено');
+        }
+        setIsLoadingGreeting(false);
+        return;
+      }
+
+      const response = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/greetings?id=eq.${id}&select=*`, {
+        method: 'GET',
+        headers: {
+          'apikey': CONFIG.SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${CONFIG.SUPABASE_ANON_KEY}`
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error('Database unavailable');
+      }
+
+      const data = await response.json();
+      if (data && data.length > 0) {
+        setGreetingData(data[0]);
+      } else {
+        setGreetingError('Поздравление не найдено');
+      }
+    } catch (err) {
+      setGreetingError('Не удалось загрузить поздравление. Попробуйте ещё раз.');
+    } finally {
+      setIsLoadingGreeting(false);
+    }
+  };
+
+  const handlePhotoSelect = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    if (!['image/jpeg', 'image/png', 'image/webp', 'image/jpg'].includes(file.type)) {
+      setErrorMessage('Пожалуйста, выберите изображение формата JPG, PNG или WEBP');
+      return;
+    }
+
+    try {
+      setErrorMessage('');
+      const compressed = await compressImage(file);
+      setPhotoFile(compressed);
+      setPhotoPreview(URL.createObjectURL(compressed));
+    } catch (err) {
+      setErrorMessage('Не удалось обработать фотографию. Попробуйте другую.');
+    }
+  };
+
+  const handleMusicSelect = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    if (file.size > 12 * 1024 * 1024) {
+      setErrorMessage('Файл музыки слишком большой. Максимальный размер 12 МБ.');
+      return;
+    }
+
+    if (!['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-m4a', 'audio/ogg', 'audio/aac'].includes(file.type) && !file.name.match(/\.(mp3|wav|m4a|ogg)$/i)) {
+      setErrorMessage('Поддерживаются только аудиофайлы MP3, WAV, M4A, OGG');
+      return;
+    }
+
+    setErrorMessage('');
+    setMusicFile(file);
+  };
+
+  const handleCreateGreeting = async () => {
+    if (!name.trim()) {
+      setErrorMessage('Пожалуйста, введите имя именинника');
+      setStep(1);
+      return;
+    }
+    if (!photoFile) {
+      setErrorMessage('Добавьте фотографию именинника');
+      setStep(2);
+      return;
+    }
+    if (!musicFile) {
+      setErrorMessage('Добавьте фоновую музыку');
+      setStep(3);
+      return;
+    }
+
+    setErrorMessage('');
+    setIsCreating(true);
+    setCreationProgress(20);
+
+    try {
+      const uniqueId = Math.random().toString(36).substring(2, 9);
+      const fileExt = photoFile.name.split('.').pop();
+      const photoPath = `${uniqueId}_photo.${fileExt}`;
+      const musicExt = musicFile.name.split('.').pop();
+      const musicPath = `${uniqueId}_music.${musicExt}`;
+
+      setCreationProgress(40);
+      const photoUrl = await uploadToSupabaseStorage(photoFile, photoPath);
+      
+      setCreationProgress(70);
+      const musicUrl = await uploadToSupabaseStorage(musicFile, musicPath);
+
+      setCreationProgress(90);
+      await saveGreetingRecord(uniqueId, name.trim(), photoUrl, musicUrl);
+
+      setCreationProgress(100);
+      const baseUrl = window.location.origin + window.location.pathname;
+      const finalUrl = `${baseUrl}?id=${uniqueId}`;
+      setShareUrl(finalUrl);
+      
+      setTimeout(() => {
+        setIsCreating(false);
+        setView('created');
+      }, 500);
+
+    } catch (err) {
+      setIsCreating(false);
+      setErrorMessage('Не удалось загрузить файлы. Проверьте подключение и попробуйте снова.');
+    }
+  };
+
+  const copyToClipboard = () => {
+    navigator.clipboard.writeText(shareUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 3000);
+  };
+
+  const shareToWhatsApp = () => {
+    const text = `Для тебя есть особенное поздравление 🎁\nОткрой по ссылке:\n${shareUrl}`;
+    window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank');
+  };
+
+  const toggleMusicPlayback = () => {
+    if (!audioRef.current) return;
+    if (isPlayingMusic) {
+      audioRef.current.pause();
+      setIsPlayingMusic(false);
+    } else {
+      audioRef.current.play().then(() => {
+        setIsPlayingMusic(true);
+      }).catch(() => {});
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-[#111113] text-[#F3F3F5] font-sans antialiased selection:bg-neutral-800 selection:text-white">
+      
+      {/* ===================== VIEW 1: HOME & CREATION WIZARD ===================== */}
+      {view === 'home' && (
+        <div className="max-w-xl mx-auto px-6 py-12 md:py-20 flex flex-col items-center">
+          
+          {/* Top navigation / Guide Button */}
+          <div className="w-full flex justify-between items-center mb-10">
+            <div className="flex items-center gap-2">
+              <div className="w-2.5 h-2.5 rounded-full bg-neutral-400 animate-pulse"></div>
+              <span className="text-xs uppercase tracking-widest text-neutral-400 font-medium">Atelier v2.6</span>
+            </div>
+            <button 
+              onClick={() => setView('guide')} 
+              className="text-xs text-neutral-400 hover:text-white transition flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-neutral-800 bg-neutral-900/60"
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+              <span>Инструкция & GitHub</span>
+            </button>
+          </div>
+
+          {/* Hero Header */}
+          <div className="text-center space-y-3 mb-10">
+            <h1 className="text-3xl md:text-5xl font-light tracking-tight text-white">
+              Создай красивое поздравление
+            </h1>
+            <p className="text-sm md:text-base text-neutral-400 font-light max-w-md mx-auto">
+              Персональная страница, которую можно отправить имениннику одной ссылкой
+            </p>
+          </div>
+
+          {/* Progress Steps Indicator */}
+          <div className="w-full grid grid-cols-4 gap-2 mb-8">
+            {[
+              { num: 1, label: 'Имя' },
+              { num: 2, label: 'Фото' },
+              { num: 3, label: 'Музыка' },
+              { num: 4, label: 'Готово' }
+            ].map((s) => (
+              <button
+                key={s.num}
+                onClick={() => { if (s.num < 4) setStep(s.num); }}
+                className={`py-2 px-1 text-center rounded-lg text-xs transition border ${
+                  step === s.num 
+                    ? 'border-neutral-500 bg-neutral-800 text-white font-medium shadow-sm' 
+                    : step > s.num 
+                    ? 'border-neutral-800 bg-neutral-900/40 text-neutral-300' 
+                    : 'border-neutral-900 bg-neutral-950 text-neutral-600'
+                }`}
+              >
+                <span className="block text-[10px] text-neutral-500 mb-0.5">0{s.num}</span>
+                <span className="truncate">{s.label}</span>
+              </button>
+            ))}
+          </div>
+
+          {/* Error Banner */}
+          {errorMessage && (
+            <div className="w-full mb-6 p-4 rounded-xl bg-neutral-900 border border-neutral-800 text-amber-200 text-sm flex items-center gap-3 animate-shake">
+              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>{errorMessage}</span>
+            </div>
+          )}
+
+          {/* MAIN FORM CARD */}
+          <div className="w-full bg-[#161619] border border-neutral-800/80 rounded-2xl p-6 md:p-8 shadow-2xl relative overflow-hidden">
+            
+            {/* STEP 1: NAME */}
+            {step === 1 && (
+              <div className="space-y-6 animate-fadeIn">
+                <div className="space-y-2">
+                  <label className="block text-xs uppercase tracking-wider text-neutral-400 font-medium">
+                    Имя именинника
+                  </label>
+                  <input
+                    type="text"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="Например, Алина"
+                    className="w-full px-4 py-3.5 bg-neutral-900 border border-neutral-800 rounded-xl text-white placeholder-neutral-600 focus:outline-none focus:border-neutral-600 text-lg transition"
+                    autoFocus
+                  />
+                  <p className="text-xs text-neutral-500 pt-1">
+                    Имя будет использоваться в заголовках персональной страницы.
+                  </p>
+                </div>
+
+                <div className="pt-4 flex justify-end">
+                  <button
+                    onClick={() => {
+                      if (!name.trim()) {
+                        setErrorMessage('Введите имя именинника');
+                        return;
+                      }
+                      setErrorMessage('');
+                      setStep(2);
+                    }}
+                    className="px-6 py-3 bg-white text-neutral-950 font-medium rounded-xl hover:bg-neutral-200 transition flex items-center gap-2 text-sm shadow"
+                  >
+                    <span>Далее: Фотография</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* STEP 2: PHOTO */}
+            {step === 2 && (
+              <div className="space-y-6 animate-fadeIn">
+                <div className="space-y-2">
+                  <label className="block text-xs uppercase tracking-wider text-neutral-400 font-medium">
+                    Главное фото именинника
+                  </label>
+                  <p className="text-xs text-neutral-500">
+                    Выберите качественное фото. Изображение будет автоматически оптимизировано для быстрой загрузки.
+                  </p>
+                </div>
+
+                {photoPreview ? (
+                  <div className="relative w-full aspect-square md:aspect-[4/3] rounded-xl overflow-hidden border border-neutral-800 bg-neutral-900 group">
+                    <img src={photoPreview} alt="Preview" className="w-full h-full object-cover" />
+                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center gap-3">
+                      <label className="px-4 py-2 bg-white text-neutral-950 rounded-lg text-xs font-medium cursor-pointer hover:bg-neutral-200 transition">
+                        Изменить фото
+                        <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handlePhotoSelect} className="hidden" />
+                      </label>
+                      <button 
+                        onClick={() => { setPhotoFile(null); setPhotoPreview(null); }}
+                        className="px-4 py-2 bg-neutral-900/80 text-rose-300 rounded-lg text-xs font-medium hover:bg-neutral-900 transition border border-rose-900/30"
+                      >
+                        Удалить
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <label className="w-full border-2 border-dashed border-neutral-800 hover:border-neutral-600 rounded-2xl p-10 flex flex-col items-center justify-center cursor-pointer transition bg-neutral-900/40 group">
+                    <div className="w-14 h-14 rounded-full bg-neutral-800 flex items-center justify-center text-neutral-400 group-hover:text-white group-hover:scale-105 transition mb-3">
+                      <Camera className="w-6 h-6" />
+                    </div>
+                    <span className="text-sm font-medium text-white mb-1">Добавить фотографию</span>
+                    <span className="text-xs text-neutral-500 text-center">JPG, PNG или WEBP (авто-сжатие до 2 МБ)</span>
+                    <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handlePhotoSelect} className="hidden" />
+                  </label>
+                )}
+
+                <div className="pt-4 flex justify-between items-center">
+                  <button
+                    onClick={() => setStep(1)}
+                    className="px-4 py-2 text-neutral-400 hover:text-white text-xs transition"
+                  >
+                    Назад
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (!photoFile) {
+                        setErrorMessage('Пожалуйста, добавьте фотографию');
+                        return;
+                      }
+                      setErrorMessage('');
+                      setStep(3);
+                    }}
+                    className="px-6 py-3 bg-white text-neutral-950 font-medium rounded-xl hover:bg-neutral-200 transition flex items-center gap-2 text-sm shadow"
+                  >
+                    <span>Далее: Музыка</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* STEP 3: MUSIC */}
+            {step === 3 && (
+              <div className="space-y-6 animate-fadeIn">
+                <div className="space-y-2">
+                  <label className="block text-xs uppercase tracking-wider text-neutral-400 font-medium">
+                    Фоновая музыка
+                  </label>
+                  <p className="text-xs text-neutral-500">
+                    Музыка заиграет на странице поздравления после нажатия кнопки открытия.
+                  </p>
+                </div>
+
+                {musicFile ? (
+                  <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl flex items-center justify-between">
+                    <div className="flex items-center gap-3 overflow-hidden">
+                      <div className="w-10 h-10 rounded-lg bg-neutral-800 flex items-center justify-center text-neutral-300 shrink-0">
+                        <Music className="w-5 h-5 animate-pulse" />
+                      </div>
+                      <div className="overflow-hidden">
+                        <p className="text-sm font-medium text-white truncate">{musicFile.name}</p>
+                        <p className="text-xs text-neutral-500">{(musicFile.size / (1024 * 1024)).toFixed(1)} МБ</p>
+                      </div>
+                    </div>
+                    <button 
+                      onClick={() => setMusicFile(null)}
+                      className="text-xs text-rose-400 hover:text-rose-300 p-2 shrink-0"
+                    >
+                      Удалить
+                    </button>
+                  </div>
+                ) : (
+                  <label className="w-full border-2 border-dashed border-neutral-800 hover:border-neutral-600 rounded-2xl p-10 flex flex-col items-center justify-center cursor-pointer transition bg-neutral-900/40 group">
+                    <div className="w-14 h-14 rounded-full bg-neutral-800 flex items-center justify-center text-neutral-400 group-hover:text-white group-hover:scale-105 transition mb-3">
+                      <Music className="w-6 h-6" />
+                    </div>
+                    <span className="text-sm font-medium text-white mb-1">Добавить фоновую музыку</span>
+                    <span className="text-xs text-neutral-500 text-center">MP3, WAV, M4A или OGG (до 12 МБ)</span>
+                    <input type="file" accept="audio/mpeg,audio/mp3,audio/wav,audio/x-m4a,audio/ogg" onChange={handleMusicSelect} className="hidden" />
+                  </label>
+                )}
+
+                <div className="pt-6 border-t border-neutral-800/80 flex justify-between items-center">
+                  <button
+                    onClick={() => setStep(2)}
+                    className="px-4 py-2 text-neutral-400 hover:text-white text-xs transition"
+                  >
+                    Назад
+                  </button>
+                  <button
+                    onClick={handleCreateGreeting}
+                    disabled={isCreating}
+                    className="px-8 py-3.5 bg-white text-neutral-950 font-medium rounded-xl hover:bg-neutral-200 transition flex items-center gap-2 text-sm shadow disabled:opacity-50"
+                  >
+                    {isCreating ? (
+                      <>
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                        <span>Создаем поздравление...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-4 h-4" />
+                        <span>Создать поздравление</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {isCreating && (
+                  <div className="w-full bg-neutral-900 rounded-full h-1.5 overflow-hidden mt-4">
+                    <div 
+                      className="bg-white h-full transition-all duration-300 ease-out" 
+                      style={{ width: `${creationProgress}%` }}
+                    ></div>
+                  </div>
+                )}
+              </div>
+            )}
+
+          </div>
+
+          {/* Footer note */}
+          <div className="mt-8 text-center text-xs text-neutral-500">
+            Безопасно • Без регистрации • Совместно с Supabase & GitHub Pages
+          </div>
+        </div>
+      )}
+
+      {/* ===================== VIEW 2: CREATED SUCCESS SCREEN ===================== */}
+      {view === 'created' && (
+        <div className="max-w-xl mx-auto px-6 py-16 flex flex-col items-center animate-fadeIn">
+          <div className="w-16 h-16 rounded-full bg-neutral-900 border border-neutral-800 flex items-center justify-center text-white mb-6 shadow-inner">
+            <Sparkles className="w-7 h-7" />
+          </div>
+
+          <h2 className="text-2xl md:text-3xl font-light text-white text-center mb-2">
+            Ваше поздравление готово!
+          </h2>
+          <p className="text-sm text-neutral-400 text-center mb-8 max-w-md font-light">
+            Персональная страница для <span className="text-white font-medium">{name}</span> успешно создана и сохранена.
+          </p>
+
+          <div className="w-full bg-[#161619] border border-neutral-800 rounded-2xl p-6 mb-6 shadow-xl space-y-4">
+            <div className="space-y-1">
+              <label className="text-xs uppercase tracking-wider text-neutral-500 font-medium">Уникальная ссылка</label>
+              <div className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-3">
+                <input 
+                  type="text" 
+                  readOnly 
+                  value={shareUrl} 
+                  className="bg-transparent text-sm text-white w-full outline-none select-all"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2">
+              <button
+                onClick={copyToClipboard}
+                className="w-full py-3 px-4 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-xl text-white font-medium text-sm flex items-center justify-center gap-2 transition"
+              >
+                {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-neutral-400" />}
+                <span>{copied ? 'Ссылка скопирована ✓' : 'Копировать ссылку'}</span>
+              </button>
+
+              <button
+                onClick={shareToWhatsApp}
+                className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm flex items-center justify-center gap-2 transition rounded-xl shadow-lg shadow-emerald-950/30"
+              >
+                <Share2 className="w-4 h-4" />
+                <span>Поделиться в WhatsApp</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <a
+              href={shareUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 py-3.5 bg-white text-neutral-950 font-medium rounded-xl text-center hover:bg-neutral-200 transition text-sm shadow"
+            >
+              Открыть поздравление
+            </a>
+            <button
+              onClick={() => {
+                setView('home');
+                setStep(1);
+                setName('');
+                setPhotoFile(null);
+                setPhotoPreview(null);
+                setMusicFile(null);
+              }}
+              className="flex-1 py-3.5 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-neutral-300 font-medium rounded-xl text-center transition text-sm"
+            >
+              Создать новое
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ===================== VIEW 3: GREETING EXPERIENCE (RECIPIENT) ===================== */}
+      {view === 'greeting' && (
+        <div className="min-h-screen w-full flex flex-col items-center justify-center relative overflow-hidden bg-[#0d0d0f]">
+          
+          {isLoadingGreeting && (
+            <div className="flex flex-col items-center gap-3 animate-fadeIn">
+              <div className="w-8 h-8 border-2 border-neutral-700 border-t-white rounded-full animate-spin"></div>
+              <p className="text-sm text-neutral-400 font-light">Загружаем поздравление...</p>
+            </div>
+          )}
+
+          {greetingError && (
+            <div className="max-w-md mx-auto p-8 text-center space-y-4 bg-[#161619] border border-neutral-800 rounded-2xl m-4">
+              <div className="w-12 h-12 rounded-full bg-rose-950/40 text-rose-400 flex items-center justify-center mx-auto mb-2 border border-rose-900/50">
+                <AlertCircle className="w-6 h-6" />
+              </div>
+              <h3 className="text-lg font-medium text-white">{greetingError}</h3>
+              <p className="text-xs text-neutral-400">Проверьте правильность ссылки или создайте свое собственное поздравление.</p>
+              <button
+                onClick={() => { window.location.href = window.location.pathname; }}
+                className="px-6 py-3 bg-white text-neutral-950 rounded-xl text-sm font-medium hover:bg-neutral-200 transition inline-block"
+              >
+                Создать своё поздравление
+              </button>
+            </div>
+          )}
+
+          {greetingData && !isOpened && (
+            /* INTRO GATE (Required for autoplay music policy compliance) */
+            <div className="absolute inset-0 z-50 flex flex-col items-center justify-center p-6 bg-[#0d0d0f] animate-fadeIn text-center">
+              <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.03)_0,transparent_70%)] pointer-events-none"></div>
+              
+              <div className="space-y-3 max-w-md z-10 mb-10">
+                <span className="text-xs uppercase tracking-widest text-neutral-500 font-medium block">Персональное приглашение</span>
+                <h1 className="text-3xl md:text-4xl font-light text-white tracking-tight">
+                  Для тебя есть кое-что особенное…
+                </h1>
+                <p className="text-sm text-neutral-400 font-light">
+                  Нажми на кнопку ниже, чтобы открыть поздравление и включить музыку.
+                </p>
+              </div>
+
+              <button
+                onClick={() => {
+                  setIsOpened(true);
+                  if (audioRef.current && greetingData.music_url) {
+                    audioRef.current.play().then(() => {
+                      setIsPlayingMusic(true);
+                    }).catch(() => {});
+                  }
+                }}
+                className="z-10 px-8 py-4 bg-white text-neutral-950 font-medium rounded-2xl hover:bg-neutral-200 transition shadow-2xl flex items-center gap-3 text-base group scale-100 hover:scale-105 active:scale-95 duration-200"
+              >
+                <Play className="w-5 h-5 fill-neutral-950" />
+                <span>Открыть поздравление</span>
+              </button>
+            </div>
+          )}
+
+          {/* AUDIO ELEMENT */}
+          {greetingData && greetingData.music_url && (
+            <audio 
+              ref={audioRef} 
+              src={greetingData.music_url} 
+              loop 
+              preload="auto"
+            />
+          )}
+
+          {/* MAIN BIRTHDAY EXPERIENCE CONTENT */}
+          {greetingData && isOpened && (
+            <div className="w-full min-h-screen py-16 px-4 flex flex-col items-center justify-between relative z-10 animate-fadeIn">
+              
+              {/* Floating Mute/Unmute Control */}
+              <button
+                onClick={toggleMusicPlayback}
+                className="fixed top-6 right-6 z-50 p-3 rounded-full bg-neutral-900/80 border border-neutral-800 text-white hover:bg-neutral-800 transition backdrop-blur-md shadow-lg"
+                title={isPlayingMusic ? "Выключить музыку" : "Включить музыку"}
+              >
+                {isPlayingMusic ? <Volume2 className="w-5 h-5 animate-pulse text-emerald-400" /> : <VolumeX className="w-5 h-5 text-neutral-400" />}
+              </button>
+
+              <div className="max-w-xl w-full mx-auto space-y-16 my-auto text-center">
+                
+                {/* SCREEN 1: HERO & PHOTO */}
+                <div className="space-y-6 animate-slideUp">
+                  <span className="text-xs uppercase tracking-widest text-neutral-400 font-medium block">
+                    Сегодня особенный день
+                  </span>
+                  
+                  <div className="relative w-48 h-48 md:w-64 md:h-64 mx-auto rounded-2xl overflow-hidden border border-neutral-800 shadow-2xl group">
+                    <img 
+                      src={greetingData.photo_url} 
+                      alt={greetingData.name} 
+                      className="w-full h-full object-cover scale-105 group-hover:scale-100 transition duration-700"
+                    />
+                  </div>
+
+                  <h1 className="text-4xl md:text-6xl font-light text-white tracking-tight">
+                    С Днём Рождения, <span className="font-normal">{greetingData.name}</span>!
+                  </h1>
+                </div>
+
+                {/* SCREEN 2: WARM MESSAGE */}
+                <div className="p-8 bg-[#161619]/60 border border-neutral-800/80 rounded-2xl backdrop-blur-md shadow-xl animate-slideUp" style={{ animationDelay: '200ms' }}>
+                  <p className="text-lg md:text-xl text-neutral-300 font-light leading-relaxed">
+                    “Пусть этот день станет началом ещё одного прекрасного года твоей жизни.”
+                  </p>
+                </div>
+
+                {/* SCREEN 3: WISHES CHIPS */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 animate-slideUp" style={{ animationDelay: '400ms' }}>
+                  {[
+                    "Счастья",
+                    "Любви",
+                    "Здоровья",
+                    "Ярких моментов",
+                    "Исполнения желаний"
+                  ].map((wish, idx) => (
+                    <div 
+                      key={idx}
+                      className="p-4 bg-[#161619]/40 border border-neutral-800/60 rounded-xl text-sm text-neutral-300 font-medium text-center hover:border-neutral-700 transition"
+                    >
+                      {wish}
+                    </div>
+                  ))}
+                </div>
+
+                {/* SCREEN 4: FINALE */}
+                <div className="space-y-4 pt-4 animate-slideUp" style={{ animationDelay: '600ms' }}>
+                  <p className="text-sm text-neutral-400 font-light">
+                    Пусть впереди будет ещё больше счастливых моментов.
+                  </p>
+                  <div className="text-2xl font-light text-white flex items-center justify-center gap-2">
+                    <span>С Днём Рождения, {greetingData.name}</span>
+                    <Heart className="w-5 h-5 text-neutral-400 fill-neutral-800" />
+                  </div>
+                </div>
+
+              </div>
+
+              {/* Bottom Brand Watermark */}
+              <div className="mt-16 text-center text-xs text-neutral-600">
+                Создано с теплом • Персональное поздравление
+              </div>
+
+            </div>
+          )}
+
+        </div>
+      )}
+
+      {/* ===================== VIEW 4: SETUP & GITHUB PAGES GUIDE ===================== */}
+      {view === 'guide' && (
+        <div className="max-w-2xl mx-auto px-6 py-12 animate-fadeIn">
+          <div className="flex justify-between items-center mb-8">
+            <h2 className="text-2xl font-light text-white">Инструкция по развертыванию</h2>
+            <button 
+              onClick={() => setView('home')} 
+              className="px-4 py-2 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 hover:text-white transition"
+            >
+              ← На главную
+            </button>
+          </div>
+
+          <div className="space-y-6 text-sm text-neutral-300 font-light leading-relaxed">
+            <div className="bg-[#161619] border border-neutral-800 rounded-2xl p-6 space-y-3">
+              <h3 className="text-base font-medium text-white flex items-center gap-2">
+                <Globe className="w-4 h-4 text-neutral-400" />
+                <span>1. Настройка Supabase Storage и Database</span>
+              </h3>
+              <p>
+                Зайдите в <a href="https://supabase.com" target="_blank" rel="noreferrer" className="underline text-white">Supabase</a>, создайте проект и выполните следующие действия:
+              </p>
+              <ul className="list-disc pl-5 space-y-1.5 text-neutral-400 text-xs">
+                <li>В разделе <b>Storage</b> создайте публичный bucket с названием <code className="bg-neutral-900 px-1.5 py-0.5 rounded text-neutral-200">greetings-media</code>.</li>
+                <li>В разделе <b>SQL Editor</b> выполните скрипт для создания таблицы:
+                  <pre className="mt-2 p-3 bg-neutral-950 rounded-lg text-[11px] text-neutral-300 overflow-x-auto font-mono">
+{`CREATE TABLE greetings (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  photo_url TEXT NOT NULL,
+  music_url TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);`}
+                  </pre>
+                </li>
+                <li>Настройте политики RLS (Row Level Security): разрешите публичный INSERT и SELECT для таблицы <code className="bg-neutral-900 px-1.5 py-0.5 rounded text-neutral-200">greetings</code> и публичный доступ для storage bucket.</li>
+              </ul>
+            </div>
+
+            <div className="bg-[#161619] border border-neutral-800 rounded-2xl p-6 space-y-3">
+              <h3 className="text-base font-medium text-white flex items-center gap-2">
+                <Terminal className="w-4 h-4 text-neutral-400" />
+                <span>2. Подключение ключей в коде</span>
+              </h3>
+              <p>
+                В начале файла <code className="bg-neutral-900 px-1.5 py-0.5 rounded text-neutral-200">App.jsx</code> в объекте <code className="bg-neutral-900 px-1.5 py-0.5 rounded text-neutral-200">CONFIG</code> укажите ваш <code className="text-white">SUPABASE_URL</code> и <code className="text-white">SUPABASE_ANON_KEY</code>.
+              </p>
+            </div>
+
+            <div className="bg-[#161619] border border-neutral-800 rounded-2xl p-6 space-y-3">
+              <h3 className="text-base font-medium text-white flex items-center gap-2">
+                <Smartphone className="w-4 h-4 text-neutral-400" />
+                <span>3. Публикация на GitHub Pages</span>
+              </h3>
+              <ol className="list-decimal pl-5 space-y-1.5 text-neutral-400 text-xs">
+                <li>Создайте репозиторий на GitHub.</li>
+                <li>Соберите проект (если используется Vite: <code className="bg-neutral-900 px-1 py-0.5 rounded text-neutral-200">npm run build</code>).</li>
+                <li>Загрузите файлы в ветку <code className="bg-neutral-900 px-1 py-0.5 rounded text-neutral-200">gh-pages</code> или настройте GitHub Actions для автоматической сборки.</li>
+                <li>В настройках репозитория (Settings &gt; Pages) включите GitHub Pages. Ссылки вида <code className="text-white">https://username.github.io/repo/?id=abc123xyz</code> будут работать автоматически благодаря встроенному роутеру параметров!</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
